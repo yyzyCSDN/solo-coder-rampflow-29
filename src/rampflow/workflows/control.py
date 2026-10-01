@@ -109,11 +109,7 @@ class RampWorkflowControl:
         return self._guard(operation_id, "hazmat.policy.load.committed", subject, at, action, requirements=requirements)
 
     def commit_fuel_ledger_batch(self, operation_id: str, subject: str, at: datetime, action: Callable[[], T], requirements: tuple[Decision, ...] = ()) -> OperationReceipt:
-        event = self.stream.publish(operation_id, utc(at), "fuel.ledger.batch.committed", subject, {"operation_id": operation_id})
-        result = action()
-        receipt = OperationReceipt(operation_id, event.topic, subject, event, result)
-        self._receipts[operation_id] = receipt
-        return receipt
+        return self._guard(operation_id, "fuel.ledger.batch.committed", subject, at, action, requirements=requirements)
 
     def commit_turnaround_stand(self, operation_id: str, subject: str, at: datetime, action: Callable[[], T], requirements: tuple[Decision, ...] = ()) -> OperationReceipt:
         return self._guard(operation_id, "turnaround.stand.committed", subject, at, action, requirements=requirements)

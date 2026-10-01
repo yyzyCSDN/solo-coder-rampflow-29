@@ -6,7 +6,7 @@ from rampflow.timeutil import Window
 from rampflow.event_stream import EventStream
 from rampflow.ops_store import VersionedStore, VersionConflict
 from rampflow.operational_snapshot import SnapshotCodec
-from rampflow.fuel_accounting import FuelTank, FuelLedger
+from rampflow.fuel_accounting import FuelTank, FuelLedger, FuelDeliveryRequest, FuelAccountingError
 from rampflow.crew_duty_control import CrewMember, CrewDutyController, DutySegment
 from rampflow.operational_policy import PolicyRule, PolicyContext, PolicyEngine, Effect
 from rampflow.service_windows import ServiceWindowRule, ServiceWindowPlanner
@@ -42,6 +42,58 @@ class PublicTests(unittest.TestCase):
         d=ledger.record('D1','F1','T1',Decimal('10'),Decimal('1010'),Decimal('15'),Decimal('0.8'),Decimal('1.2'),D(10))
         self.assertEqual(d.corrected_l,Decimal('1000.000'))
         self.assertEqual(ledger.inventory_l['T1'],Decimal('4000.000'))
+
+    def test_fuel_reversal_offsets_booked_volume(self):
+        ledger=FuelLedger([FuelTank('T1',Decimal('10000'),Decimal('5000'),Decimal('0.8'))])
+        d=ledger.record('D1','F1','T1',Decimal('0'),Decimal('1000'),Decimal('35'),Decimal('0.8'),Decimal('1.2'),D(10))
+        self.assertLess(d.corrected_l,Decimal('1000'))
+        r=ledger.reverse('D1','R1',D(11))
+        self.assertEqual(r.corrected_l,-d.corrected_l)
+        self.assertEqual(r.mass_kg,-d.mass_kg)
+        self.assertEqual(r.amount,-d.amount)
+        self.assertEqual(r.basis,d.basis)
+        self.assertEqual(ledger.inventory_l['T1'],Decimal('5000.000'))
+        summary=ledger.flight_summary('F1')
+        self.assertEqual(summary['volume_l'],Decimal('0.000'))
+        self.assertEqual(summary['mass_kg'],Decimal('0.000'))
+        self.assertEqual(summary['amount'],Decimal('0.00'))
+
+    def test_fuel_reversal_replay_never_double_counts(self):
+        ledger=FuelLedger([FuelTank('T1',Decimal('10000'),Decimal('5000'),Decimal('0.8'))])
+        ledger.record('D1','F1','T1',Decimal('0'),Decimal('1000'),Decimal('35'),Decimal('0.8'),Decimal('1.2'),D(10))
+        first=ledger.reverse('D1','R1',D(11))
+        second=ledger.reverse('D1','R1',D(12))
+        self.assertIs(first,second)
+        self.assertEqual(ledger.inventory_l['T1'],Decimal('5000.000'))
+        with self.assertRaises(FuelAccountingError):
+            ledger.reverse('D1','R2',D(13))
+        with self.assertRaises(FuelAccountingError):
+            ledger.record('R1','F9','T1',Decimal('0'),Decimal('10'),Decimal('15'),Decimal('0.8'),Decimal('1.2'),D(14))
+
+    def test_fuel_batch_is_all_or_nothing(self):
+        ledger=FuelLedger([FuelTank('T1',Decimal('10000'),Decimal('5000'),Decimal('0.8'))])
+        ok=FuelDeliveryRequest('D1','F1','T1',Decimal('0'),Decimal('1000'),Decimal('15'),Decimal('0.8'),Decimal('1.2'),D(10))
+        too_much=FuelDeliveryRequest('D2','F1','T1',Decimal('0'),Decimal('9999'),Decimal('15'),Decimal('0.8'),Decimal('1.2'),D(11))
+        with self.assertRaises(FuelAccountingError):
+            ledger.record_batch([ok,too_much])
+        self.assertEqual(ledger.deliveries,{})
+        self.assertEqual(ledger.inventory_l['T1'],Decimal('5000.000'))
+        dup=FuelDeliveryRequest('D1','F1','T1',Decimal('0'),Decimal('100'),Decimal('15'),Decimal('0.8'),Decimal('1.2'),D(12))
+        with self.assertRaises(FuelAccountingError):
+            ledger.record_batch([ok,dup])
+
+    def test_fuel_batch_replay_draws_inventory_once(self):
+        ledger=FuelLedger([FuelTank('T1',Decimal('10000'),Decimal('5000'),Decimal('0.8'))])
+        reqs=[FuelDeliveryRequest('D1','F1','T1',Decimal('0'),Decimal('1000'),Decimal('35'),Decimal('0.8'),Decimal('1.2'),D(10)),
+              FuelDeliveryRequest('D2','F1','T1',Decimal('1000'),Decimal('2000'),Decimal('35'),Decimal('0.8'),Decimal('1.2'),D(11))]
+        first=ledger.record_batch(reqs)
+        level=ledger.inventory_l['T1']
+        second=ledger.record_batch(reqs)
+        self.assertEqual(first,second)
+        self.assertEqual(ledger.inventory_l['T1'],level)
+        conflict=FuelDeliveryRequest('D1','F2','T1',Decimal('0'),Decimal('1000'),Decimal('35'),Decimal('0.8'),Decimal('1.2'),D(10))
+        with self.assertRaises(FuelAccountingError):
+            ledger.record_batch([conflict])
 
     def test_crew_qualification_enforced(self):
         c=CrewDutyController([CrewMember('C1',frozenset({'push'}),'A',600,600,240)])
